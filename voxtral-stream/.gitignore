@@ -1,0 +1,2 @@
+# cmake build tree (root-owned because cmake runs inside docker)
+build/
