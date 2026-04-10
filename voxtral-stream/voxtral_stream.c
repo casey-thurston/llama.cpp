@@ -583,11 +583,24 @@ static float * run_conv_stem_stream(vox_stream_t * s, int * out_count) {
            mel_buf + (size_t) new_mel_local * VOX_MEL_BINS,
            (size_t) n_new_mel * VOX_MEL_BINS * sizeof(float));
 
-    /* Left-pad with 2 zero frames for conv0's causal padding. */
-    int mel_padded_len = 2 + n_in_mel;
+    /* Left-pad with 2 zero frames ONLY on the first chunk (no tail yet).
+     * On subsequent chunks the mel_tail IS the real left context. */
+    int left_pad = (s->mel_tail_count == 0) ? 2 : 0;
+
+    /* With small chunks, we may not have enough mel to produce conv1 output.
+     * Require at least 5 total mel frames (tail + new) to guarantee conv0
+     * produces ≥ 3 outputs (enough for conv1 kernel=3). If not enough,
+     * DON'T advance mel_consumed — let the frames accumulate until the
+     * next feed provides enough. */
+    if (left_pad == 0 && n_in_mel < 5) {
+        free(mel_in_ggml);
+        return NULL;
+    }
+
+    int mel_padded_len = left_pad + n_in_mel;
     float * mel_padded = (float *) calloc((size_t) VOX_MEL_BINS * mel_padded_len, sizeof(float));
     if (!mel_padded) { free(mel_in_ggml); return NULL; }
-    memcpy(mel_padded + 2 * VOX_MEL_BINS, mel_in_ggml, (size_t) VOX_MEL_BINS * n_in_mel * sizeof(float));
+    memcpy(mel_padded + left_pad * VOX_MEL_BINS, mel_in_ggml, (size_t) VOX_MEL_BINS * n_in_mel * sizeof(float));
 
     /* Update mel_tail: keep last 2 frames of mel_in_ggml. */
     int mt_want = n_in_mel < 2 ? n_in_mel : 2;
@@ -635,16 +648,18 @@ static float * run_conv_stem_stream(vox_stream_t * s, int * out_count) {
      * Permute back to [c0_full_len, 1280] and make contiguous. */
     struct ggml_tensor * c0_for_c1 = ggml_cont(gctx, ggml_permute(gctx, c0, 1, 0, 2, 3));
 
-    /* Left-pad c0 with 1 zero column for conv1's causal padding. We use
-     * ggml_pad which pads the ne[0] dimension. c0_for_c1 has ne[0]=c0_full_len.
-     * ggml_pad pads on the RIGHT; we need LEFT. So we'll pad the input and
-     * accept a slightly different output count.
-     *
-     * Actually: ggml_pad pads with zeros at the end of each dimension. For LEFT
-     * padding, the simplest approach is to create a zero tensor and concat. */
-    struct ggml_tensor * zero_col = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, 1, VOX_ENC_DIM);
-    ggml_set_name(zero_col, "conv.zero"); ggml_set_input(zero_col);
-    struct ggml_tensor * c0_padded = ggml_concat(gctx, zero_col, c0_for_c1, 0);
+    /* Left-pad c0 for conv1's causal padding — only on the first call
+     * (global c1 position 0 has left padding). On subsequent calls the c0
+     * output from the mel_tail already provides the needed left context. */
+    struct ggml_tensor * c0_padded;
+    struct ggml_tensor * zero_col = NULL;
+    if (s->c1_produced == 0) {
+        zero_col = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, 1, VOX_ENC_DIM);
+        ggml_set_name(zero_col, "conv.zero"); ggml_set_input(zero_col);
+        c0_padded = ggml_concat(gctx, zero_col, c0_for_c1, 0);
+    } else {
+        c0_padded = c0_for_c1;
+    }
 
     /* Conv1: stride=2, p=0. */
     struct ggml_tensor * c1_raw = ggml_conv_1d(gctx, s->w->encoder.conv1, c0_padded, 2, 0, 1);
@@ -674,11 +689,12 @@ static float * run_conv_stem_stream(vox_stream_t * s, int * out_count) {
     free(mel_cm);
     free(mel_padded);
 
-    /* Set zero column (already zeroed by calloc in tensor alloc? No — backend
-     * buffer is uninitialized. Set explicitly.) */
-    float zero_buf[VOX_ENC_DIM];
-    memset(zero_buf, 0, sizeof(zero_buf));
-    ggml_backend_tensor_set(zero_col, zero_buf, 0, sizeof(zero_buf));
+    /* Set zero column for conv1 left-pad (only on first call). */
+    if (zero_col) {
+        float zero_buf[VOX_ENC_DIM];
+        memset(zero_buf, 0, sizeof(zero_buf));
+        ggml_backend_tensor_set(zero_col, zero_buf, 0, sizeof(zero_buf));
+    }
 
     if (ggml_backend_graph_compute(s->backend, gf) != GGML_STATUS_SUCCESS) {
         ggml_gallocr_free(galloc); ggml_free(gctx);
