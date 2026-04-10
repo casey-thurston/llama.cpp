@@ -37,7 +37,16 @@ extern "C" {
 #define VOX_DEC_NORM_EPS   1e-5f
 #define VOX_VOCAB_SIZE     131072
 #define VOX_ROPE_THETA     1000000.0f
+
 #define VOX_ENC_DIM        1280
+#define VOX_ENC_HEADS      32
+#define VOX_ENC_KV_HEADS   32   /* full MHA, not GQA */
+#define VOX_ENC_HEAD_DIM   64
+#define VOX_ENC_HIDDEN     5120
+#define VOX_ENC_WINDOW     750
+#define VOX_ENC_NORM_EPS   1e-5f
+#define VOX_MEL_BINS       128
+
 #define VOX_DOWNSAMPLE     4
 
 /* ------------------------------------------------------------------ */
@@ -95,6 +104,9 @@ typedef struct {
  *   - kv_pos: physical write position for the new step (== n_kv - 1).
  *             Used to compute byte offsets into the cache views for ggml_cpy.
  *   - kv: per-layer KV cache tensors (length VOX_DEC_LAYERS_HDR).
+ *   - ada_scaled: per-layer (1 + ada_scale) F32 [dec_dim] precomputed by the
+ *                 orchestrator from delay_tokens. Pass NULL to skip the
+ *                 multiplication entirely (equivalent to delay_tokens=0).
  *
  * Caller is responsible for filling input/pos/mask via ggml_backend_tensor_set
  * before calling ggml_backend_graph_compute. */
@@ -102,8 +114,29 @@ vox_decoder_graph_t vox_build_decoder_graph(
     struct ggml_context * gctx,
     const vox_weights_t * w,
     const vox_kv_cache_layer_t * kv, /* length VOX_DEC_LAYERS_HDR */
+    struct ggml_tensor * const * ada_scaled, /* length VOX_DEC_LAYERS_HDR or NULL */
     int n_kv,
     int kv_pos);
+
+/* ------------------------------------------------------------------ */
+/* Encoder (full sequence in one graph -- offline path)               */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    struct ggml_cgraph * gf;
+    struct ggml_tensor * input;   /* f32 [enc_dim, n_pos] -- post-conv-stem hidden */
+    struct ggml_tensor * pos;     /* i32 [n_pos] -- RoPE positions, 0..n_pos-1 */
+    struct ggml_tensor * mask;    /* f32 [n_pos, n_pos, 1, 1] -- causal sliding-window */
+    struct ggml_tensor * output;  /* f32 [enc_dim, n_pos] -- final encoder hidden */
+} vox_encoder_graph_t;
+
+/* Build the offline encoder graph for n_pos positions (the conv stem runs in
+ * plain C in the orchestrator and produces this n_pos-length sequence). The
+ * graph runs all 32 transformer layers + the final RMSNorm. */
+vox_encoder_graph_t vox_build_encoder_graph(
+    struct ggml_context * gctx,
+    const vox_weights_t * w,
+    int n_pos);
 
 #ifdef __cplusplus
 }

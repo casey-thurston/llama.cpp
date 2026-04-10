@@ -114,7 +114,9 @@ vox_adapter_graph_t vox_build_adapter_graph(
 /* Build a single decoder transformer layer. `x` is the residual stream
  * coming in; the function adds the attention residual then the FFN residual
  * and returns the updated residual stream. KV cache writes are forward-
- * expanded into `gf` so they execute even though they're side-effects. */
+ * expanded into `gf` so they execute even though they're side-effects.
+ * If `ada_scaled` is non-NULL, the FFN-side norm output is multiplied by it
+ * (precomputed (1 + ada_scale[layer]) from delay_tokens). */
 static struct ggml_tensor * build_decoder_layer(
     struct ggml_context * gctx,
     struct ggml_cgraph * gf,
@@ -123,6 +125,7 @@ static struct ggml_tensor * build_decoder_layer(
     struct ggml_tensor * x,
     struct ggml_tensor * pos,
     struct ggml_tensor * mask,
+    struct ggml_tensor * ada_scaled, /* may be NULL */
     int n_kv,
     int kv_pos)
 {
@@ -234,10 +237,12 @@ static struct ggml_tensor * build_decoder_layer(
     /* ---- FFN ---- */
     struct ggml_tensor * h = rms_norm_w(gctx, x, lw->ffn_norm, VOX_DEC_NORM_EPS);
 
-    /* TODO(1E): adaptive RMSNorm:
-     *   h = ggml_mul(gctx, h, ggml_add(gctx, ggml_ones, ada_scale[layer]))
-     * For 1D smoke test (no orchestrator yet) we skip this -- equivalent to
-     * delay_tokens=0 / ada_scale=0 / multiplier=1. */
+    /* Adaptive RMSNorm: h *= (1 + ada_scale[layer]) on the FFN side only.
+     * The orchestrator passes precomputed (1 + ada_scale[layer]) tensors so
+     * the graph only needs an elementwise multiply. NULL means delay=0. */
+    if (ada_scaled) {
+        h = ggml_mul(gctx, h, ada_scaled);
+    }
 
     /* SwiGLU PAR: gate = silu(w1 @ h),  up = w3 @ h,  out = w2 @ (gate * up) */
     struct ggml_tensor * gate = linear(gctx, lw->w1, h);     /* [hidden, 1] */
@@ -255,6 +260,7 @@ vox_decoder_graph_t vox_build_decoder_graph(
     struct ggml_context * gctx,
     const vox_weights_t * w,
     const vox_kv_cache_layer_t * kv,
+    struct ggml_tensor * const * ada_scaled,
     int n_kv,
     int kv_pos)
 {
@@ -287,10 +293,11 @@ vox_decoder_graph_t vox_build_decoder_graph(
     /* Walk all 26 layers */
     struct ggml_tensor * x = input;
     for (int i = 0; i < VOX_DEC_LAYERS; i++) {
+        struct ggml_tensor * ada_i = ada_scaled ? ada_scaled[i] : NULL;
         x = build_decoder_layer(gctx, gf,
                                 &w->decoder.layers[i],
                                 &kv[i],
-                                x, pos, mask_f16,
+                                x, pos, mask_f16, ada_i,
                                 n_kv, kv_pos);
     }
 
@@ -309,3 +316,147 @@ vox_decoder_graph_t vox_build_decoder_graph(
     out.logits = logits;
     return out;
 }
+
+/* ------------------------------------------------------------------ */
+/* Encoder graph (offline, full sequence)                             */
+/* ------------------------------------------------------------------ */
+
+/* Encoder transformer layer. Differences from the decoder layer:
+ *   - biases on wq/wv/wo and w2 (wk/w1/w3 have no bias)
+ *   - full MHA: n_kv_heads == n_heads, head_dim=64
+ *   - no KV cache, no ada_scale, no streaming -- offline path
+ *   - the K/V we compute are also the K/V we attend to (self-attention) */
+static struct ggml_tensor * build_encoder_layer(
+    struct ggml_context * gctx,
+    const vox_enc_layer_w_t * lw,
+    struct ggml_tensor * x,
+    struct ggml_tensor * pos,
+    struct ggml_tensor * mask,
+    int n_pos)
+{
+    const int dim      = VOX_ENC_DIM;
+    const int n_heads  = VOX_ENC_HEADS;       /* 32 */
+    const int head_dim = VOX_ENC_HEAD_DIM;    /* 64 */
+    const float kq_scale = 1.0f / sqrtf((float) head_dim);
+
+    /* ---- attention ---- */
+    struct ggml_tensor * x_norm = rms_norm_w(gctx, x, lw->attention_norm, VOX_ENC_NORM_EPS);
+
+    /* QKV projections (encoder has biases on q/v/o, none on k). */
+    struct ggml_tensor * Qcur = linear(gctx, lw->wq, x_norm);
+    Qcur = ggml_add(gctx, Qcur, lw->wq_bias);
+
+    struct ggml_tensor * Kcur = linear(gctx, lw->wk, x_norm);
+    /* wk has NO bias */
+
+    struct ggml_tensor * Vcur = linear(gctx, lw->wv, x_norm);
+    Vcur = ggml_add(gctx, Vcur, lw->wv_bias);
+
+    /* Reshape for RoPE: [head_dim, n_heads, n_pos]. Full MHA so K/V also use n_heads. */
+    Qcur = ggml_reshape_3d(gctx, Qcur, head_dim, n_heads, n_pos);
+    Kcur = ggml_reshape_3d(gctx, Kcur, head_dim, n_heads, n_pos);
+    Vcur = ggml_reshape_3d(gctx, Vcur, head_dim, n_heads, n_pos);
+
+    /* Interleaved RoPE on Q and K (mode=0 = NORMAL). */
+    Qcur = ggml_rope_ext(gctx, Qcur, pos, NULL,
+                         head_dim, 0, 0,
+                         VOX_ROPE_THETA, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    Kcur = ggml_rope_ext(gctx, Kcur, pos, NULL,
+                         head_dim, 0, 0,
+                         VOX_ROPE_THETA, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
+    /* For self-attention with the full sequence in one shot, K and V ARE
+     * Kcur/Vcur (no cache). Permute to [head_dim, n_pos, n_heads] (the
+     * flash_attn_ext layout). */
+    struct ggml_tensor * Q_perm = ggml_permute(gctx, Qcur, 0, 2, 1, 3);
+    struct ggml_tensor * K_perm = ggml_permute(gctx, Kcur, 0, 2, 1, 3);
+    struct ggml_tensor * V_perm = ggml_permute(gctx, Vcur, 0, 2, 1, 3);
+
+    /* Make K and V contiguous (cont) before passing to flash_attn_ext --
+     * permutes are non-contiguous views. Q can stay as a view since
+     * flash_attn handles q permutations directly per llama.cpp. */
+    struct ggml_tensor * K_cont = ggml_cont(gctx, K_perm);
+    struct ggml_tensor * V_cont = ggml_cont(gctx, V_perm);
+
+    struct ggml_tensor * K_for_attn = ggml_cast(gctx, K_cont, GGML_TYPE_F16);
+    struct ggml_tensor * V_for_attn = ggml_cast(gctx, V_cont, GGML_TYPE_F16);
+
+    struct ggml_tensor * attn = ggml_flash_attn_ext(
+        gctx, Q_perm, K_for_attn, V_for_attn, mask,
+        kq_scale, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+
+    /* Reshape result [head_dim, n_heads, n_pos] -> [q_dim, n_pos]. */
+    attn = ggml_reshape_2d(gctx, attn, head_dim * n_heads, n_pos);
+
+    /* Output projection + bias + residual. */
+    struct ggml_tensor * proj = linear(gctx, lw->wo, attn);
+    proj = ggml_add(gctx, proj, lw->wo_bias);
+
+    x = ggml_add(gctx, x, proj);
+
+    /* ---- FFN ---- */
+    struct ggml_tensor * h = rms_norm_w(gctx, x, lw->ffn_norm, VOX_ENC_NORM_EPS);
+
+    /* SwiGLU: gate = silu(w1 @ h), up = w3 @ h, ffn = w2 @ (gate*up) + w2_bias */
+    struct ggml_tensor * gate = linear(gctx, lw->w1, h);
+    gate = ggml_silu(gctx, gate);
+    struct ggml_tensor * up = linear(gctx, lw->w3, h);
+    struct ggml_tensor * gu = ggml_mul(gctx, gate, up);
+    struct ggml_tensor * ffn = linear(gctx, lw->w2, gu);
+    ffn = ggml_add(gctx, ffn, lw->w2_bias);
+
+    x = ggml_add(gctx, x, ffn);
+
+    return x;
+}
+
+vox_encoder_graph_t vox_build_encoder_graph(
+    struct ggml_context * gctx,
+    const vox_weights_t * w,
+    int n_pos)
+{
+    vox_encoder_graph_t out = {0};
+
+    /* Inputs */
+    struct ggml_tensor * input = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, VOX_ENC_DIM, n_pos);
+    ggml_set_name(input, "encoder.input");
+    ggml_set_input(input);
+
+    /* Causal sliding-window mask: [n_pos, n_pos, 1, 1] F32. The orchestrator
+     * fills this with 0 where j <= i and -INF where j > i (or beyond window). */
+    struct ggml_tensor * mask = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_pos, n_pos, 1, 1);
+    ggml_set_name(mask, "encoder.mask");
+    ggml_set_input(mask);
+
+    struct ggml_tensor * mask_f16 = ggml_cast(gctx, mask, GGML_TYPE_F16);
+
+    /* Position vector for RoPE: [n_pos] i32 with values 0..n_pos-1. */
+    struct ggml_tensor * pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_pos);
+    ggml_set_name(pos, "encoder.pos");
+    ggml_set_input(pos);
+
+    /* Build the cgraph */
+    struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, 8192, false);
+
+    /* 32 transformer layers */
+    struct ggml_tensor * x = input;
+    for (int i = 0; i < VOX_ENC_LAYERS; i++) {
+        x = build_encoder_layer(gctx, &w->encoder.layers[i], x, pos, mask_f16, n_pos);
+    }
+
+    /* Final RMSNorm * encoder.norm */
+    x = rms_norm_w(gctx, x, w->encoder.norm, VOX_ENC_NORM_EPS);
+    ggml_set_name(x, "encoder.output");
+    ggml_set_output(x);
+
+    ggml_build_forward_expand(gf, x);
+
+    out.gf = gf;
+    out.input = input;
+    out.pos = pos;
+    out.mask = mask;
+    out.output = x;
+    return out;
+}
+
