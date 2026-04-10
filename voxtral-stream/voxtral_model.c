@@ -299,17 +299,23 @@ vox_decoder_graph_t vox_build_decoder_graph(
 
     /* Final RMSNorm + tied LM head */
     x = rms_norm_w(gctx, x, w->decoder.norm, VOX_DEC_NORM_EPS);
-    struct ggml_tensor * logits = linear(gctx, w->decoder.tok_embeddings, x); /* [vocab, 1] */
+    struct ggml_tensor * logits = linear(gctx, w->decoder.tok_embeddings, x); /* [vocab, n_tokens] */
     ggml_set_name(logits, "decoder.logits");
     ggml_set_output(logits);
 
-    ggml_build_forward_expand(gf, logits);
+    /* GPU-side argmax — avoids reading 512KB of logits back to CPU. */
+    struct ggml_tensor * argmax_t = ggml_argmax(gctx, logits); /* [n_tokens] i32 */
+    ggml_set_name(argmax_t, "decoder.argmax");
+    ggml_set_output(argmax_t);
+
+    ggml_build_forward_expand(gf, argmax_t);
 
     out.gf     = gf;
     out.input  = input;
     out.pos    = pos;
     out.mask   = mask;
     out.logits = logits;
+    out.argmax = argmax_t;
     return out;
 }
 

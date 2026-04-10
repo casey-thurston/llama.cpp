@@ -97,7 +97,6 @@ struct vox_stream {
     /* Reusable per-step buffers. */
     float * tok_embed_buf;    /* [VOX_DEC_DIM] */
     float * input_embed_buf;  /* [VOX_DEC_DIM] */
-    float * logits_buf;       /* [VOX_VOCAB_SIZE] */
 
     /* Streaming pipeline state (reset by vox_stream_reset). */
     vox_mel_ctx_t * mel_ctx;
@@ -871,24 +870,22 @@ static int run_decoder_step_streaming(vox_stream_t * s) {
     int32_t pos_val = pos;
     ggml_backend_tensor_set(dg.pos, &pos_val, 0, sizeof(int32_t));
 
-    float * mask_buf = (float *) calloc(n_kv, sizeof(float));
+    /* Decoder mask: all zeros (single-token step can attend to everything
+     * in the cache). Use a stack buffer to avoid malloc/free per step. */
+    float mask_buf[512];
+    memset(mask_buf, 0, n_kv * sizeof(float));
     ggml_backend_tensor_set(dg.mask, mask_buf, 0, n_kv * sizeof(float));
-    free(mask_buf);
 
     if (ggml_backend_graph_compute(s->backend, dg.gf) != GGML_STATUS_SUCCESS) {
         ggml_gallocr_free(galloc); ggml_free(gctx);
         return -1;
     }
 
-    ggml_backend_tensor_get(dg.logits, s->logits_buf, 0, VOX_VOCAB_SIZE * sizeof(float));
+    /* Read argmax from GPU — 4 bytes instead of 512KB logits readback. */
+    int32_t argmax = 0;
+    ggml_backend_tensor_get(dg.argmax, &argmax, 0, sizeof(int32_t));
     ggml_gallocr_free(galloc);
     ggml_free(gctx);
-
-    int argmax = 0;
-    float lmax = s->logits_buf[0];
-    for (int i = 1; i < VOX_VOCAB_SIZE; i++) {
-        if (s->logits_buf[i] > lmax) { lmax = s->logits_buf[i]; argmax = i; }
-    }
 
     if (pos >= prompt_len - 1) {
         if (argmax == TOKEN_EOS) {
@@ -972,20 +969,13 @@ static int run_decoder_prefill(vox_stream_t * s, int prompt_len) {
         return -1;
     }
 
-    /* Read logits for the LAST prompt position only (index prompt_len-1).
-     * logits tensor shape: [vocab, prompt_len]. We want row prompt_len-1. */
-    ggml_backend_tensor_get(dg.logits, s->logits_buf,
-        (size_t) (prompt_len - 1) * VOX_VOCAB_SIZE * sizeof(float),
-        VOX_VOCAB_SIZE * sizeof(float));
+    /* Read GPU argmax for the LAST prompt position (index prompt_len-1).
+     * argmax tensor shape: [prompt_len] i32. We want the last element. */
+    int32_t argmax = 0;
+    ggml_backend_tensor_get(dg.argmax, &argmax,
+        (size_t) (prompt_len - 1) * sizeof(int32_t), sizeof(int32_t));
     ggml_gallocr_free(galloc);
     ggml_free(gctx);
-
-    /* Argmax for the first generated token. */
-    int argmax = 0;
-    float lmax = s->logits_buf[0];
-    for (int i = 1; i < VOX_VOCAB_SIZE; i++) {
-        if (s->logits_buf[i] > lmax) { lmax = s->logits_buf[i]; argmax = i; }
-    }
 
     if (argmax == TOKEN_EOS) {
         s->eos_seen = 1;
@@ -1191,7 +1181,6 @@ static int run_offline_pipeline(vox_stream_t * s) {
     int prev_token = -1;
     float * tok_embed_buf = (float *) malloc(VOX_DEC_DIM * sizeof(float));
     float * input_embed   = (float *) malloc(VOX_DEC_DIM * sizeof(float));
-    float * logits_buf    = (float *) malloc(VOX_VOCAB_SIZE * sizeof(float));
 
     VLOG(s, "decoder loop: %d audio positions, prompt_len=%d\n", n_audio, prompt_len);
 
@@ -1233,15 +1222,10 @@ static int run_offline_pipeline(vox_stream_t * s) {
             rc = -1; break;
         }
 
-        ggml_backend_tensor_get(dg.logits, logits_buf, 0, VOX_VOCAB_SIZE * sizeof(float));
+        int32_t argmax = 0;
+        ggml_backend_tensor_get(dg.argmax, &argmax, 0, sizeof(int32_t));
         ggml_gallocr_free(galloc);
         ggml_free(gctx);
-
-        int argmax = 0;
-        float lmax = logits_buf[0];
-        for (int i = 1; i < VOX_VOCAB_SIZE; i++) {
-            if (logits_buf[i] > lmax) { lmax = logits_buf[i]; argmax = i; }
-        }
 
         /* Generation begins at pos == prompt_len - 1. */
         if (pos >= prompt_len - 1) {
@@ -1256,7 +1240,6 @@ static int run_offline_pipeline(vox_stream_t * s) {
 
     free(tok_embed_buf);
     free(input_embed);
-    free(logits_buf);
     free(audio_embeds);
     return rc;
 }
@@ -1373,8 +1356,7 @@ vox_stream_t * vox_stream_init(const char * model_dir, const vox_stream_opts_t *
     /* Reusable per-step buffers. */
     s->tok_embed_buf   = (float *) malloc(VOX_DEC_DIM * sizeof(float));
     s->input_embed_buf = (float *) malloc(VOX_DEC_DIM * sizeof(float));
-    s->logits_buf      = (float *) malloc(VOX_VOCAB_SIZE * sizeof(float));
-    if (!s->tok_embed_buf || !s->input_embed_buf || !s->logits_buf) {
+    if (!s->tok_embed_buf || !s->input_embed_buf) {
         fprintf(stderr, "vox_stream: per-step buffer alloc failed\n"); goto fail;
     }
 
@@ -1518,7 +1500,6 @@ void vox_stream_free(vox_stream_t * s) {
     free(s->conv1_b);
     free(s->tok_embed_buf);
     free(s->input_embed_buf);
-    free(s->logits_buf);
     free(s->enc_outputs);
     free(s->audio_embeds);
     free(s->samples);

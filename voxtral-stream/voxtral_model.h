@@ -91,10 +91,11 @@ typedef struct {
 
 typedef struct {
     struct ggml_cgraph * gf;
-    struct ggml_tensor * input;      /* f32 [dec_dim, 1] -- the new step's input embedding */
-    struct ggml_tensor * pos;        /* i32 [1] -- logical RoPE position for this step */
-    struct ggml_tensor * mask;       /* f32 [n_kv_padded, 1] -- attention mask (0 or -INF) */
-    struct ggml_tensor * logits;     /* f32 [vocab] -- output logits over the tied vocab */
+    struct ggml_tensor * input;      /* f32 [dec_dim, n_tokens] -- input embeddings */
+    struct ggml_tensor * pos;        /* i32 [n_tokens] -- logical RoPE positions */
+    struct ggml_tensor * mask;       /* f32 [n_kv, n_tokens] -- attention mask (0 or -INF) */
+    struct ggml_tensor * logits;     /* f32 [vocab, n_tokens] -- output logits */
+    struct ggml_tensor * argmax;     /* i32 [n_tokens] -- GPU-side argmax (NULL if not requested) */
 } vox_decoder_graph_t;
 
 /* Build the single-token decoder step graph.
