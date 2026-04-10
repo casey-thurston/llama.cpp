@@ -33,6 +33,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "ggml-cuda.h"
 
 #include "voxtral_tokenizer.h"
 #include "voxtral_audio.h"
@@ -158,7 +159,8 @@ typedef struct {
     struct ggml_tensor   * scaled[26];
 } ada_state_t;
 
-static void ada_state_compute(ada_state_t * a, const vox_weights_t * w, int delay_tokens) {
+static void ada_state_compute(ada_state_t * a, const vox_weights_t * w,
+                              ggml_backend_buffer_type_t buft, int delay_tokens) {
     /* Allocate context + tensors */
     struct ggml_init_params ip = {
         /* .mem_size  = */ ggml_tensor_overhead() * 64,
@@ -172,7 +174,7 @@ static void ada_state_compute(ada_state_t * a, const vox_weights_t * w, int dela
         snprintf(name, sizeof(name), "ada_scaled.%d", i);
         ggml_set_name(a->scaled[i], name);
     }
-    a->buf = ggml_backend_alloc_ctx_tensors_from_buft(a->ctx, ggml_backend_cpu_buffer_type());
+    a->buf = ggml_backend_alloc_ctx_tensors_from_buft(a->ctx, buft);
     if (!a->buf) die("ada_state: backend buffer alloc failed");
 
     /* Compute t_cond on CPU */
@@ -236,7 +238,7 @@ typedef struct {
     vox_kv_cache_layer_t   layers[26];
 } kv_cache_t;
 
-static void kv_cache_alloc(kv_cache_t * c, int max_seq) {
+static void kv_cache_alloc(kv_cache_t * c, ggml_backend_buffer_type_t buft, int max_seq) {
     struct ggml_init_params ip = {
         /* .mem_size  = */ ggml_tensor_overhead() * 64,
         /* .mem_buffer = */ NULL,
@@ -254,7 +256,7 @@ static void kv_cache_alloc(kv_cache_t * c, int max_seq) {
         snprintf(name, sizeof(name), "kv.v.%d", i);
         ggml_set_name(c->layers[i].v, name);
     }
-    c->buf = ggml_backend_alloc_ctx_tensors_from_buft(c->ctx, ggml_backend_cpu_buffer_type());
+    c->buf = ggml_backend_alloc_ctx_tensors_from_buft(c->ctx, buft);
     if (!c->buf) die("kv_cache: backend buffer alloc failed");
 }
 
@@ -410,11 +412,26 @@ int main(int argc, char ** argv) {
     vox_tokenizer_t * tok = vox_tokenizer_load(path);
     if (!tok) die("tokenizer load failed");
 
-    /* ---- Weights (CPU backend buffer) ---- */
+    /* ---- CUDA backend ---- */
+    if (ggml_backend_cuda_get_device_count() < 1) die("no CUDA device available");
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) die("ggml_backend_cuda_init failed");
+    ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(0);
+    {
+        char dev_desc[256];
+        ggml_backend_cuda_get_device_description(0, dev_desc, sizeof(dev_desc));
+        size_t dev_free = 0, dev_total = 0;
+        ggml_backend_cuda_get_device_memory(0, &dev_free, &dev_total);
+        fprintf(stderr, "CUDA device 0: %s (%.1f / %.1f GB free)\n",
+                dev_desc, dev_free / (1024.0 * 1024.0 * 1024.0),
+                dev_total / (1024.0 * 1024.0 * 1024.0));
+    }
+
+    /* ---- Weights (CUDA backend buffer) ---- */
     fprintf(stderr, "loading weights: %s\n", model_dir);
-    vox_weights_t * w = vox_weights_load(model_dir, ggml_backend_cpu_buffer_type());
+    vox_weights_t * w = vox_weights_load(model_dir, buft);
     if (!w) die("vox_weights_load failed");
-    fprintf(stderr, "  %d tensors, %.2f GB\n",
+    fprintf(stderr, "  %d tensors, %.2f GB on CUDA\n",
             w->n_tensors, (double) w->n_bytes / (1024.0 * 1024.0 * 1024.0));
 
     /* ---- WAV + mel ---- */
@@ -448,10 +465,6 @@ int main(int argc, char ** argv) {
     free(mel);
     fprintf(stderr, "post-conv-stem: enc_seq_len=%d\n", enc_seq_len);
 
-    /* ---- CPU backend ---- */
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    if (!backend) die("ggml_backend_cpu_init failed");
-
     /* ---- Encoder graph ---- */
     {
         struct ggml_init_params ip = {
@@ -464,7 +477,7 @@ int main(int argc, char ** argv) {
         vox_encoder_graph_t eg = vox_build_encoder_graph(gctx, w, enc_seq_len);
         fprintf(stderr, "encoder graph: %d nodes\n", ggml_graph_n_nodes(eg.gf));
 
-        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+        ggml_gallocr_t galloc = ggml_gallocr_new(buft);
         if (!ggml_gallocr_alloc_graph(galloc, eg.gf)) die("encoder gallocr_alloc_graph failed");
         fprintf(stderr, "  compute buffer: %.2f MB\n",
                 (double) ggml_gallocr_get_buffer_size(galloc, 0) / (1024.0 * 1024.0));
@@ -512,7 +525,7 @@ int main(int argc, char ** argv) {
         };
         struct ggml_context * gctx = ggml_init(ip);
         vox_adapter_graph_t ag = vox_build_adapter_graph(gctx, w, enc_seq_len);
-        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+        ggml_gallocr_t galloc = ggml_gallocr_new(buft);
         if (!ggml_gallocr_alloc_graph(galloc, ag.gf)) die("adapter gallocr_alloc_graph failed");
         ggml_backend_tensor_set(ag.input, enc_input, 0, (size_t) VOX_ENC_DIM * enc_seq_len * sizeof(float));
         if (ggml_backend_graph_compute(backend, ag.gf) != GGML_STATUS_SUCCESS)
@@ -526,14 +539,14 @@ int main(int argc, char ** argv) {
 
     /* ---- ada_scaled precompute ---- */
     ada_state_t ada = {0};
-    ada_state_compute(&ada, w, N_DELAY_TOKENS);
+    ada_state_compute(&ada, w, buft, N_DELAY_TOKENS);
     struct ggml_tensor * ada_arr[26];
     for (int i = 0; i < 26; i++) ada_arr[i] = ada.scaled[i];
     fprintf(stderr, "ada_scaled precomputed for delay_tokens=%d\n", N_DELAY_TOKENS);
 
     /* ---- KV cache (offline path needs n_audio positions) ---- */
     kv_cache_t kv = {0};
-    kv_cache_alloc(&kv, n_audio + 32);
+    kv_cache_alloc(&kv, buft, n_audio + 32);
     fprintf(stderr, "kv cache: %.2f MB across 26 layers (max_seq=%d)\n",
             (double) ggml_backend_buffer_get_size(kv.buf) / (1024.0 * 1024.0), kv.max_seq);
 
@@ -584,7 +597,7 @@ int main(int argc, char ** argv) {
         };
         struct ggml_context * gctx = ggml_init(ip);
         vox_decoder_graph_t dg = vox_build_decoder_graph(gctx, w, kv.layers, ada_arr, n_kv, kv_pos);
-        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+        ggml_gallocr_t galloc = ggml_gallocr_new(buft);
         if (!ggml_gallocr_alloc_graph(galloc, dg.gf)) die("decoder gallocr_alloc_graph failed");
 
         ggml_backend_tensor_set(dg.input, input_embed, 0, VOX_DEC_DIM * sizeof(float));

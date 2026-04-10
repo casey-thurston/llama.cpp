@@ -60,6 +60,7 @@ case "${cmd}" in
             cmake -B build -S . \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DGGML_CUDA=ON \
+                -DGGML_CUDA_NCCL=OFF \
                 -DCMAKE_CUDA_ARCHITECTURES=87
             cmake --build build -j$(nproc)
         '
