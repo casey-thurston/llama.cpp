@@ -212,12 +212,9 @@ static struct ggml_tensor * build_decoder_layer(
     /* Permute Q from [head_dim, n_heads, n_tokens] to [head_dim, n_tokens, n_heads]. */
     struct ggml_tensor * Q_perm = ggml_permute(gctx, Qcur, 0, 2, 1, 3);
 
-    /* flash_attn_ext expects K/V dtype f16 (matches llama.cpp's build_attn_mha). */
-    struct ggml_tensor * K_for_attn = ggml_cast(gctx, K_perm, GGML_TYPE_F16);
-    struct ggml_tensor * V_for_attn = ggml_cast(gctx, V_perm, GGML_TYPE_F16);
-
+    /* flash_attn_ext handles F16 K/V natively (KV cache is F16). */
     struct ggml_tensor * attn = ggml_flash_attn_ext(
-        gctx, Q_perm, K_for_attn, V_for_attn, mask,
+        gctx, Q_perm, K_perm, V_perm, mask,
         kq_scale,
         0.0f,   /* max_bias (no ALiBi) */
         0.0f);  /* logit_softcap (none) */
@@ -374,14 +371,14 @@ static struct ggml_tensor * build_encoder_layer(
     /* Make K and V contiguous (cont) before passing to flash_attn_ext --
      * permutes are non-contiguous views. Q can stay as a view since
      * flash_attn handles q permutations directly per llama.cpp. */
+    /* Make K and V contiguous (cont) before passing to flash_attn_ext —
+     * permutes are non-contiguous views and fattn needs contiguous K/V
+     * for the offline (non-cache) encoder path. */
     struct ggml_tensor * K_cont = ggml_cont(gctx, K_perm);
     struct ggml_tensor * V_cont = ggml_cont(gctx, V_perm);
 
-    struct ggml_tensor * K_for_attn = ggml_cast(gctx, K_cont, GGML_TYPE_F16);
-    struct ggml_tensor * V_for_attn = ggml_cast(gctx, V_cont, GGML_TYPE_F16);
-
     struct ggml_tensor * attn = ggml_flash_attn_ext(
-        gctx, Q_perm, K_for_attn, V_for_attn, mask,
+        gctx, Q_perm, K_cont, V_cont, mask,
         kq_scale, 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
 
@@ -493,11 +490,9 @@ static struct ggml_tensor * build_encoder_step_layer(
     /* Permute Q from [head_dim, n_heads, n_new] to [head_dim, n_new, n_heads]. */
     struct ggml_tensor * Q_perm = ggml_permute(gctx, Qcur, 0, 2, 1, 3);
 
-    struct ggml_tensor * K_for_attn = ggml_cast(gctx, K_perm, GGML_TYPE_F16);
-    struct ggml_tensor * V_for_attn = ggml_cast(gctx, V_perm, GGML_TYPE_F16);
-
+    /* flash_attn_ext handles F16 K/V natively (KV cache is F16). */
     struct ggml_tensor * attn = ggml_flash_attn_ext(
-        gctx, Q_perm, K_for_attn, V_for_attn, mask,
+        gctx, Q_perm, K_perm, V_perm, mask,
         kq_scale, 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
 

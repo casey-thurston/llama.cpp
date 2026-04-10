@@ -411,10 +411,10 @@ static int kv_cache_alloc(kv_cache_t * c, ggml_backend_buffer_type_t buft, int m
     const int kv_dim = VOX_DEC_HEAD_DIM * VOX_DEC_KV_HEADS;
     char name[32];
     for (int i = 0; i < 26; i++) {
-        c->layers[i].k = ggml_new_tensor_2d(c->ctx, GGML_TYPE_F32, kv_dim, max_seq);
+        c->layers[i].k = ggml_new_tensor_2d(c->ctx, GGML_TYPE_F16, kv_dim, max_seq);
         snprintf(name, sizeof(name), "kv.k.%d", i);
         ggml_set_name(c->layers[i].k, name);
-        c->layers[i].v = ggml_new_tensor_2d(c->ctx, GGML_TYPE_F32, kv_dim, max_seq);
+        c->layers[i].v = ggml_new_tensor_2d(c->ctx, GGML_TYPE_F16, kv_dim, max_seq);
         snprintf(name, sizeof(name), "kv.v.%d", i);
         ggml_set_name(c->layers[i].v, name);
     }
@@ -441,10 +441,10 @@ static int enc_kv_cache_alloc(enc_kv_cache_t * c, ggml_backend_buffer_type_t buf
     const int kv_dim = VOX_ENC_HEAD_DIM * VOX_ENC_HEADS;  /* full MHA */
     char name[32];
     for (int i = 0; i < VOX_ENC_LAYERS_HDR; i++) {
-        c->layers[i].k = ggml_new_tensor_2d(c->ctx, GGML_TYPE_F32, kv_dim, max_seq);
+        c->layers[i].k = ggml_new_tensor_2d(c->ctx, GGML_TYPE_F16, kv_dim, max_seq);
         snprintf(name, sizeof(name), "enc_kv.k.%d", i);
         ggml_set_name(c->layers[i].k, name);
-        c->layers[i].v = ggml_new_tensor_2d(c->ctx, GGML_TYPE_F32, kv_dim, max_seq);
+        c->layers[i].v = ggml_new_tensor_2d(c->ctx, GGML_TYPE_F16, kv_dim, max_seq);
         snprintf(name, sizeof(name), "enc_kv.v.%d", i);
         ggml_set_name(c->layers[i].v, name);
     }
