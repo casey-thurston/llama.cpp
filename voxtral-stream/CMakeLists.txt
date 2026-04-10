@@ -35,5 +35,23 @@ target_link_libraries(voxtral-stream PRIVATE voxtral_stream_obj)
 add_executable(test_stream test_stream.c)
 target_link_libraries(test_stream PRIVATE voxtral_stream_obj)
 
+# Shared library for ctypes / Wyoming integration (Phase 3).
+add_library(voxtral_stream SHARED
+    voxtral_tokenizer.c
+    voxtral_audio.c
+    voxtral_safetensors.c
+    voxtral_weights.c
+    voxtral_model.c
+    voxtral_stream.c
+)
+target_include_directories(voxtral_stream PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(voxtral_stream PUBLIC ggml m)
+set_target_properties(voxtral_stream PROPERTIES
+    OUTPUT_NAME voxtral_stream
+    SOVERSION 0
+)
+
 # voxtral_audio.c uses fmaxf/expf/log10f/etc; libm is needed.
 # Vendored sources are pure C99 plus POSIX (mmap) — no extra flags needed.
