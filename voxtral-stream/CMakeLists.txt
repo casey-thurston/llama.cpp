@@ -19,6 +19,7 @@ add_executable(voxtral-stream
     voxtral_audio.c
     voxtral_safetensors.c
     voxtral_weights.c
+    voxtral_model.c
 )
 
 target_link_libraries(voxtral-stream PRIVATE ggml m)
