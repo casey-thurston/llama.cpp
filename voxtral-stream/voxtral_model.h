@@ -138,6 +138,47 @@ vox_encoder_graph_t vox_build_encoder_graph(
     const vox_weights_t * w,
     int n_pos);
 
+/* ------------------------------------------------------------------ */
+/* Encoder (incremental step against an externally-owned KV cache)    */
+/* ------------------------------------------------------------------ */
+
+#define VOX_ENC_LAYERS_HDR 32 /* duplicated from voxtral_weights.h to keep this header self-contained */
+
+/* Per-layer encoder KV cache, externally owned. Layout matches the decoder
+ * cache: [head_dim*n_heads=2048, max_seq] F32 per K/V tensor. (Encoder is
+ * full MHA so n_kv_heads == n_heads.) */
+typedef struct {
+    struct ggml_tensor * k;          /* f32 [head_dim*n_heads, max_seq] */
+    struct ggml_tensor * v;          /* f32 [head_dim*n_heads, max_seq] */
+} vox_enc_kv_layer_t;
+
+typedef struct {
+    struct ggml_cgraph * gf;
+    struct ggml_tensor * input;   /* f32 [enc_dim, n_new] -- post-conv-stem hidden for the new positions */
+    struct ggml_tensor * pos;     /* i32 [n_new] -- absolute RoPE positions for the new positions */
+    struct ggml_tensor * mask;    /* f32 [n_total, n_new, 1, 1] -- causal sliding-window over the cache */
+    struct ggml_tensor * output;  /* f32 [enc_dim, n_new] -- final encoder hidden for the new positions */
+} vox_encoder_step_graph_t;
+
+/* Build an incremental encoder step graph that processes `n_new` new
+ * positions against the persistent encoder KV cache.
+ *
+ *   - n_total: cache occupancy AFTER this step (i.e., previous + n_new).
+ *              Used to slice K/V views to [head_dim*n_heads, n_total].
+ *   - kv_pos:  byte-offset slot for the FIRST new position. For a fresh
+ *              stream this is 0; on subsequent calls it equals n_total - n_new.
+ *   - kv:      per-layer encoder KV cache tensors (length VOX_ENC_LAYERS_HDR).
+ *
+ * Caller is responsible for filling input/pos/mask via ggml_backend_tensor_set
+ * before calling ggml_backend_graph_compute. */
+vox_encoder_step_graph_t vox_build_encoder_step_graph(
+    struct ggml_context * gctx,
+    const vox_weights_t * w,
+    const vox_enc_kv_layer_t * kv, /* length VOX_ENC_LAYERS_HDR */
+    int n_new,
+    int n_total,
+    int kv_pos);
+
 #ifdef __cplusplus
 }
 #endif

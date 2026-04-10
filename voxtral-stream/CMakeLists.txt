@@ -13,18 +13,27 @@ if(NOT TARGET ggml)
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../ggml ${CMAKE_BINARY_DIR}/ggml-build)
 endif()
 
-add_executable(voxtral-stream
-    main.c
+# Library sources -- compiled into both executables. Phase 3 will promote
+# these to a SHARED libvoxtral_stream.so target; for Phase 2 we just keep
+# them in an OBJECT library so the binaries share the compilation.
+add_library(voxtral_stream_obj OBJECT
     voxtral_tokenizer.c
     voxtral_audio.c
     voxtral_safetensors.c
     voxtral_weights.c
     voxtral_model.c
+    voxtral_stream.c
 )
-
-target_link_libraries(voxtral-stream PRIVATE ggml m)
-target_include_directories(voxtral-stream PRIVATE
+target_include_directories(voxtral_stream_obj PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+target_link_libraries(voxtral_stream_obj PUBLIC ggml m)
+
+add_executable(voxtral-stream main.c)
+target_link_libraries(voxtral-stream PRIVATE voxtral_stream_obj)
+
+add_executable(test_stream test_stream.c)
+target_link_libraries(test_stream PRIVATE voxtral_stream_obj)
+
 # voxtral_audio.c uses fmaxf/expf/log10f/etc; libm is needed.
 # Vendored sources are pure C99 plus POSIX (mmap) — no extra flags needed.

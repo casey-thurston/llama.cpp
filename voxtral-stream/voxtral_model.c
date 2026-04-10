@@ -411,6 +411,168 @@ static struct ggml_tensor * build_encoder_layer(
     return x;
 }
 
+/* Encoder transformer layer with KV cache (incremental step). Shape variant
+ * of build_encoder_layer with these differences:
+ *   - Q is computed for n_new positions only
+ *   - K/V are computed for n_new positions, written to the cache at offset
+ *     kv_pos via view+cpy (mirroring the decoder pattern)
+ *   - K/V for attention come from the cache slice [0, n_total)
+ *   - Mask shape is [n_total, n_new, 1, 1] (caller fills it) */
+static struct ggml_tensor * build_encoder_step_layer(
+    struct ggml_context * gctx,
+    struct ggml_cgraph * gf,
+    const vox_enc_layer_w_t * lw,
+    const vox_enc_kv_layer_t * cache,
+    struct ggml_tensor * x,
+    struct ggml_tensor * pos,
+    struct ggml_tensor * mask,
+    int n_new,
+    int n_total,
+    int kv_pos)
+{
+    const int dim       = VOX_ENC_DIM;
+    const int n_heads   = VOX_ENC_HEADS;       /* 32 */
+    const int head_dim  = VOX_ENC_HEAD_DIM;    /* 64 */
+    const int q_dim     = n_heads * head_dim;  /* 2048 */
+    const int kv_dim    = q_dim;               /* full MHA */
+    const float kq_scale = 1.0f / sqrtf((float) head_dim);
+
+    /* ---- attention ---- */
+    struct ggml_tensor * x_norm = rms_norm_w(gctx, x, lw->attention_norm, VOX_ENC_NORM_EPS);
+
+    /* QKV projections (encoder has biases on q/v/o, none on k). */
+    struct ggml_tensor * Qcur = linear(gctx, lw->wq, x_norm); /* [q_dim, n_new] */
+    Qcur = ggml_add(gctx, Qcur, lw->wq_bias);
+
+    struct ggml_tensor * Kcur = linear(gctx, lw->wk, x_norm); /* [kv_dim, n_new] */
+
+    struct ggml_tensor * Vcur = linear(gctx, lw->wv, x_norm); /* [kv_dim, n_new] */
+    Vcur = ggml_add(gctx, Vcur, lw->wv_bias);
+
+    /* Reshape into multi-head form. ggml_rope_ext expects positions at ne[2]. */
+    Qcur = ggml_reshape_3d(gctx, Qcur, head_dim, n_heads, n_new);
+    Kcur = ggml_reshape_3d(gctx, Kcur, head_dim, n_heads, n_new);
+    Vcur = ggml_reshape_3d(gctx, Vcur, head_dim, n_heads, n_new);
+
+    /* Interleaved RoPE on Q and K (mode=0). pos has absolute encoder positions. */
+    Qcur = ggml_rope_ext(gctx, Qcur, pos, NULL,
+                         head_dim, 0, 0,
+                         VOX_ROPE_THETA, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    Kcur = ggml_rope_ext(gctx, Kcur, pos, NULL,
+                         head_dim, 0, 0,
+                         VOX_ROPE_THETA, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
+    /* Write the new K and V into the cache at byte offset kv_pos * row_bytes.
+     * Cache row stride is the same as the decoder cache pattern. */
+    const size_t cache_row_bytes = cache->k->nb[1];
+
+    struct ggml_tensor * k_flat = ggml_reshape_1d(gctx, Kcur, kv_dim * n_new);
+    struct ggml_tensor * v_flat = ggml_reshape_1d(gctx, Vcur, kv_dim * n_new);
+
+    struct ggml_tensor * k_dst = ggml_view_1d(gctx, cache->k,
+        kv_dim * n_new, (size_t) kv_pos * cache_row_bytes);
+    struct ggml_tensor * v_dst = ggml_view_1d(gctx, cache->v,
+        kv_dim * n_new, (size_t) kv_pos * cache_row_bytes);
+
+    struct ggml_tensor * k_cpy = ggml_cpy(gctx, k_flat, k_dst);
+    struct ggml_tensor * v_cpy = ggml_cpy(gctx, v_flat, v_dst);
+    ggml_build_forward_expand(gf, k_cpy);
+    ggml_build_forward_expand(gf, v_cpy);
+
+    /* Read the full cache slice [0, n_total) for attention. */
+    struct ggml_tensor * K_view = ggml_view_2d(gctx, cache->k,
+        kv_dim, n_total, cache_row_bytes, 0);
+    struct ggml_tensor * V_view = ggml_view_2d(gctx, cache->v,
+        kv_dim, n_total, cache_row_bytes, 0);
+
+    struct ggml_tensor * K_3d = ggml_reshape_3d(gctx, K_view, head_dim, n_heads, n_total);
+    struct ggml_tensor * V_3d = ggml_reshape_3d(gctx, V_view, head_dim, n_heads, n_total);
+
+    struct ggml_tensor * K_perm = ggml_permute(gctx, K_3d, 0, 2, 1, 3); /* [head_dim, n_total, n_heads] */
+    struct ggml_tensor * V_perm = ggml_permute(gctx, V_3d, 0, 2, 1, 3);
+
+    /* Permute Q from [head_dim, n_heads, n_new] to [head_dim, n_new, n_heads]. */
+    struct ggml_tensor * Q_perm = ggml_permute(gctx, Qcur, 0, 2, 1, 3);
+
+    struct ggml_tensor * K_for_attn = ggml_cast(gctx, K_perm, GGML_TYPE_F16);
+    struct ggml_tensor * V_for_attn = ggml_cast(gctx, V_perm, GGML_TYPE_F16);
+
+    struct ggml_tensor * attn = ggml_flash_attn_ext(
+        gctx, Q_perm, K_for_attn, V_for_attn, mask,
+        kq_scale, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+
+    /* Reshape result [head_dim, n_heads, n_new] -> [q_dim, n_new]. */
+    attn = ggml_reshape_2d(gctx, attn, q_dim, n_new);
+
+    /* Output projection + bias + residual. */
+    struct ggml_tensor * proj = linear(gctx, lw->wo, attn);
+    proj = ggml_add(gctx, proj, lw->wo_bias);
+
+    x = ggml_add(gctx, x, proj);
+
+    /* ---- FFN (same as offline encoder layer) ---- */
+    struct ggml_tensor * h = rms_norm_w(gctx, x, lw->ffn_norm, VOX_ENC_NORM_EPS);
+
+    struct ggml_tensor * gate = linear(gctx, lw->w1, h);
+    gate = ggml_silu(gctx, gate);
+    struct ggml_tensor * up = linear(gctx, lw->w3, h);
+    struct ggml_tensor * gu = ggml_mul(gctx, gate, up);
+    struct ggml_tensor * ffn = linear(gctx, lw->w2, gu);
+    ffn = ggml_add(gctx, ffn, lw->w2_bias);
+
+    x = ggml_add(gctx, x, ffn);
+
+    return x;
+}
+
+vox_encoder_step_graph_t vox_build_encoder_step_graph(
+    struct ggml_context * gctx,
+    const vox_weights_t * w,
+    const vox_enc_kv_layer_t * kv,
+    int n_new,
+    int n_total,
+    int kv_pos)
+{
+    vox_encoder_step_graph_t out = {0};
+
+    struct ggml_tensor * input = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, VOX_ENC_DIM, n_new);
+    ggml_set_name(input, "encoder_step.input");
+    ggml_set_input(input);
+
+    /* Mask: rows = new query positions (n_new), cols = cache positions (n_total). */
+    struct ggml_tensor * mask = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_total, n_new, 1, 1);
+    ggml_set_name(mask, "encoder_step.mask");
+    ggml_set_input(mask);
+
+    struct ggml_tensor * mask_f16 = ggml_cast(gctx, mask, GGML_TYPE_F16);
+
+    struct ggml_tensor * pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_new);
+    ggml_set_name(pos, "encoder_step.pos");
+    ggml_set_input(pos);
+
+    struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, 8192, false);
+
+    struct ggml_tensor * x = input;
+    for (int i = 0; i < VOX_ENC_LAYERS; i++) {
+        x = build_encoder_step_layer(gctx, gf, &w->encoder.layers[i], &kv[i],
+                                     x, pos, mask_f16, n_new, n_total, kv_pos);
+    }
+
+    x = rms_norm_w(gctx, x, w->encoder.norm, VOX_ENC_NORM_EPS);
+    ggml_set_name(x, "encoder_step.output");
+    ggml_set_output(x);
+
+    ggml_build_forward_expand(gf, x);
+
+    out.gf = gf;
+    out.input = input;
+    out.pos = pos;
+    out.mask = mask;
+    out.output = x;
+    return out;
+}
+
 vox_encoder_graph_t vox_build_encoder_graph(
     struct ggml_context * gctx,
     const vox_weights_t * w,
