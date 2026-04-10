@@ -101,12 +101,14 @@ typedef struct {
  *
  *   - n_kv: total cache occupancy AFTER this step (i.e., previous + 1).
  *           Used to slice the K/V views to [head_dim, n_kv, n_kv_heads].
- *   - kv_pos: physical write position for the new step (== n_kv - 1).
+ *   - kv_pos: physical write position for the FIRST new token (== n_kv - n_tokens).
  *             Used to compute byte offsets into the cache views for ggml_cpy.
  *   - kv: per-layer KV cache tensors (length VOX_DEC_LAYERS_HDR).
  *   - ada_scaled: per-layer (1 + ada_scale) F32 [dec_dim] precomputed by the
  *                 orchestrator from delay_tokens. Pass NULL to skip the
  *                 multiplication entirely (equivalent to delay_tokens=0).
+ *   - n_tokens: number of input tokens (1 for autoregressive decode,
+ *               >1 for prompt prefill).
  *
  * Caller is responsible for filling input/pos/mask via ggml_backend_tensor_set
  * before calling ggml_backend_graph_compute. */
@@ -116,7 +118,8 @@ vox_decoder_graph_t vox_build_decoder_graph(
     const vox_kv_cache_layer_t * kv, /* length VOX_DEC_LAYERS_HDR */
     struct ggml_tensor * const * ada_scaled, /* length VOX_DEC_LAYERS_HDR or NULL */
     int n_kv,
-    int kv_pos);
+    int kv_pos,
+    int n_tokens);
 
 /* ------------------------------------------------------------------ */
 /* Encoder (full sequence in one graph -- offline path)               */

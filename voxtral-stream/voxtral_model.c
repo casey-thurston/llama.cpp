@@ -127,7 +127,8 @@ static struct ggml_tensor * build_decoder_layer(
     struct ggml_tensor * mask,
     struct ggml_tensor * ada_scaled, /* may be NULL */
     int n_kv,
-    int kv_pos)
+    int kv_pos,
+    int n_tokens)
 {
     const int dim        = VOX_DEC_DIM;
     const int n_heads    = VOX_DEC_HEADS;
@@ -147,7 +148,6 @@ static struct ggml_tensor * build_decoder_layer(
 
     /* Reshape into multi-head form. ggml_rope_ext expects positions at ne[2]
      * of the input, so the reshape order is [head_dim, n_heads, n_tokens]. */
-    const int n_tokens = 1;
     Qcur = ggml_reshape_3d(gctx, Qcur, head_dim, n_heads,    n_tokens);
     Kcur = ggml_reshape_3d(gctx, Kcur, head_dim, n_kv_heads, n_tokens);
     Vcur = ggml_reshape_3d(gctx, Vcur, head_dim, n_kv_heads, n_tokens);
@@ -262,23 +262,22 @@ vox_decoder_graph_t vox_build_decoder_graph(
     const vox_kv_cache_layer_t * kv,
     struct ggml_tensor * const * ada_scaled,
     int n_kv,
-    int kv_pos)
+    int kv_pos,
+    int n_tokens)
 {
     vox_decoder_graph_t out = {0};
 
     /* Inputs */
-    struct ggml_tensor * input = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, VOX_DEC_DIM, 1);
+    struct ggml_tensor * input = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, VOX_DEC_DIM, n_tokens);
     ggml_set_name(input, "decoder.input");
     ggml_set_input(input);
 
-    struct ggml_tensor * pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
+    struct ggml_tensor * pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_tokens);
     ggml_set_name(pos, "decoder.pos");
     ggml_set_input(pos);
 
-    /* Mask: [n_kv, 1, 1, 1] F32 input. We cast to F16 once and reuse the
-     * cast result across all 26 decoder layers (each layer's flash_attn_ext
-     * call needs the same mask). */
-    struct ggml_tensor * mask = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_kv, 1, 1, 1);
+    /* Mask: [n_kv, n_tokens, 1, 1] F32 input. */
+    struct ggml_tensor * mask = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_kv, n_tokens, 1, 1);
     ggml_set_name(mask, "decoder.mask");
     ggml_set_input(mask);
 
@@ -298,7 +297,7 @@ vox_decoder_graph_t vox_build_decoder_graph(
                                 &w->decoder.layers[i],
                                 &kv[i],
                                 x, pos, mask_f16, ada_i,
-                                n_kv, kv_pos);
+                                n_kv, kv_pos, n_tokens);
     }
 
     /* Final RMSNorm + tied LM head */

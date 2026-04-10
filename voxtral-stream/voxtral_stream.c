@@ -801,7 +801,7 @@ static int run_decoder_step_streaming(vox_stream_t * s) {
     for (int i = 0; i < 26; i++) ada_arr[i] = s->ada.scaled[i];
 
     vox_decoder_graph_t dg = vox_build_decoder_graph(gctx, s->w, s->dec_kv.layers,
-                                                      ada_arr, n_kv, kv_pos);
+                                                      ada_arr, n_kv, kv_pos, 1);
     ggml_gallocr_t galloc = ggml_gallocr_new(s->buft);
     if (!ggml_gallocr_alloc_graph(galloc, dg.gf)) {
         ggml_gallocr_free(galloc); ggml_free(gctx);
@@ -845,6 +845,101 @@ static int run_decoder_step_streaming(vox_stream_t * s) {
     return 0;
 }
 
+/* Prefill prompt_len decoder positions in a single multi-token forward pass.
+ * The prompt is [BOS, STREAMING_PAD*38]; generation starts at the LAST prompt
+ * position (index prompt_len-1). Produces at most 1 token (the first generated
+ * token from the last prompt position's logits). */
+static int run_decoder_prefill(vox_stream_t * s, int prompt_len) {
+    /* Build the combined input: audio_embed[pos] + tok_embed(prompt[pos])
+     * for pos in [0, prompt_len). */
+    float * input_buf = (float *) malloc((size_t) VOX_DEC_DIM * prompt_len * sizeof(float));
+    if (!input_buf) return -1;
+
+    int prompt[64];
+    prompt[0] = TOKEN_BOS;
+    for (int i = 1; i < prompt_len; i++) prompt[i] = TOKEN_STREAMING_PAD;
+
+    for (int pos = 0; pos < prompt_len; pos++) {
+        read_bf16_row_as_f32(s->w->decoder.tok_embeddings, prompt[pos], s->tok_embed_buf);
+        const float * audio = s->audio_embeds + (size_t) pos * VOX_DEC_DIM;
+        float * dst = input_buf + (size_t) pos * VOX_DEC_DIM;
+        for (int i = 0; i < VOX_DEC_DIM; i++)
+            dst[i] = audio[i] + s->tok_embed_buf[i];
+    }
+
+    /* Build decoder graph with n_tokens = prompt_len. */
+    const int n_kv = prompt_len;
+    const int kv_pos = 0;
+    struct ggml_init_params ip = {
+        ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false),
+        NULL, true,
+    };
+    struct ggml_context * gctx = ggml_init(ip);
+
+    struct ggml_tensor * ada_arr[26];
+    for (int i = 0; i < 26; i++) ada_arr[i] = s->ada.scaled[i];
+
+    vox_decoder_graph_t dg = vox_build_decoder_graph(gctx, s->w, s->dec_kv.layers,
+                                                      ada_arr, n_kv, kv_pos, prompt_len);
+    ggml_gallocr_t galloc = ggml_gallocr_new(s->buft);
+    if (!ggml_gallocr_alloc_graph(galloc, dg.gf)) {
+        ggml_gallocr_free(galloc); ggml_free(gctx); free(input_buf);
+        fprintf(stderr, "vox_stream: prefill gallocr failed\n");
+        return -1;
+    }
+
+    ggml_backend_tensor_set(dg.input, input_buf, 0, (size_t) VOX_DEC_DIM * prompt_len * sizeof(float));
+    free(input_buf);
+
+    /* Position tensor: [0, 1, 2, ..., prompt_len-1]. */
+    int32_t * pos_buf = (int32_t *) malloc(prompt_len * sizeof(int32_t));
+    for (int i = 0; i < prompt_len; i++) pos_buf[i] = i;
+    ggml_backend_tensor_set(dg.pos, pos_buf, 0, prompt_len * sizeof(int32_t));
+    free(pos_buf);
+
+    /* Causal mask: [n_kv, prompt_len]. mask[j, i] = 0 if j <= i, else -INF. */
+    float * mask_buf = (float *) malloc((size_t) n_kv * prompt_len * sizeof(float));
+    for (int i = 0; i < prompt_len; i++) {
+        for (int j = 0; j < n_kv; j++) {
+            mask_buf[(size_t) i * n_kv + j] = (j <= i) ? 0.0f : -INFINITY;
+        }
+    }
+    ggml_backend_tensor_set(dg.mask, mask_buf, 0, (size_t) n_kv * prompt_len * sizeof(float));
+    free(mask_buf);
+
+    if (ggml_backend_graph_compute(s->backend, dg.gf) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(galloc); ggml_free(gctx);
+        fprintf(stderr, "vox_stream: prefill graph_compute failed\n");
+        return -1;
+    }
+
+    /* Read logits for the LAST prompt position only (index prompt_len-1).
+     * logits tensor shape: [vocab, prompt_len]. We want row prompt_len-1. */
+    ggml_backend_tensor_get(dg.logits, s->logits_buf,
+        (size_t) (prompt_len - 1) * VOX_VOCAB_SIZE * sizeof(float),
+        VOX_VOCAB_SIZE * sizeof(float));
+    ggml_gallocr_free(galloc);
+    ggml_free(gctx);
+
+    /* Argmax for the first generated token. */
+    int argmax = 0;
+    float lmax = s->logits_buf[0];
+    for (int i = 1; i < VOX_VOCAB_SIZE; i++) {
+        if (s->logits_buf[i] > lmax) { lmax = s->logits_buf[i]; argmax = i; }
+    }
+
+    if (argmax == TOKEN_EOS) {
+        s->eos_seen = 1;
+    } else {
+        tokens_push(s, argmax);
+        s->prev_token = argmax;
+    }
+
+    s->decoder_pos = prompt_len;
+    VLOG(s, "prefill: %d positions in one shot, first token=%d\n", prompt_len, argmax);
+    return 0;
+}
+
 /* Advance the streaming pipeline as far as possible:
  *   new mel → conv stem → encoder → adapter → decoder → tokens. */
 static int try_advance_pipeline(vox_stream_t * s) {
@@ -869,7 +964,16 @@ static int try_advance_pipeline(vox_stream_t * s) {
         if (run_adapter_step(s, enc_start) < 0) return -1;
     }
 
-    /* 4. Decoder: run one step for each new audio embed */
+    /* 4. Decoder: prefill prompt positions in one shot, then one-at-a-time. */
+    int prompt_len = 1 + N_LEFT_PAD_TOKENS + s->opts.delay_tokens;
+
+    /* Prefill: when enough audio embeds are available and we haven't started
+     * the decoder yet, run all prompt positions as a single multi-token call. */
+    if (s->decoder_pos == 0 && s->n_audio_total >= prompt_len && !s->eos_seen) {
+        if (run_decoder_prefill(s, prompt_len) < 0) return -1;
+    }
+
+    /* Generate: single-token steps for remaining positions. */
     while (s->decoder_pos < s->n_audio_total && !s->eos_seen) {
         if (run_decoder_step_streaming(s) < 0) return -1;
     }
@@ -1053,7 +1157,7 @@ static int run_offline_pipeline(vox_stream_t * s) {
             /* .no_alloc  = */ true,
         };
         struct ggml_context * gctx = ggml_init(ip);
-        vox_decoder_graph_t dg = vox_build_decoder_graph(gctx, s->w, s->dec_kv.layers, ada_arr, n_kv, kv_pos);
+        vox_decoder_graph_t dg = vox_build_decoder_graph(gctx, s->w, s->dec_kv.layers, ada_arr, n_kv, kv_pos, 1);
         ggml_gallocr_t galloc = ggml_gallocr_new(s->buft);
         if (!ggml_gallocr_alloc_graph(galloc, dg.gf)) {
             ggml_gallocr_free(galloc); ggml_free(gctx);
@@ -1111,7 +1215,7 @@ vox_stream_opts_t vox_stream_default_opts(void) {
     vox_stream_opts_t o;
     o.backend = 1;             /* CUDA */
     o.delay_tokens = 6;
-    o.max_audio_seconds = 120;
+    o.max_audio_seconds = 30;
     o.verbose = 0;
     return o;
 }
