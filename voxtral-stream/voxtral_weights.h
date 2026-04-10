@@ -121,8 +121,14 @@ typedef struct {
 
 /* Load all 711 Voxtral Realtime 4B weights from <model_dir>/consolidated.safetensors
  * into a single backend buffer of type `buft`. Returns NULL on any error.
- * Logs every missing/unmapped tensor to stderr. */
-vox_weights_t * vox_weights_load(const char * model_dir, ggml_backend_buffer_type_t buft);
+ * Logs every missing/unmapped tensor to stderr.
+ *
+ * matmul_type controls the dtype for matmul weight tensors:
+ *   GGML_TYPE_BF16 = load as-is from safetensors (default, zero-copy)
+ *   GGML_TYPE_Q8_0 = quantize BF16 -> F32 -> Q8_0 at load time (~2x smaller)
+ * Norm/bias/conv tensors are always F32 regardless of this setting. */
+vox_weights_t * vox_weights_load(const char * model_dir, ggml_backend_buffer_type_t buft,
+                                  enum ggml_type matmul_type);
 
 /* Free the backend buffer, ggml context, and the struct itself. */
 void vox_weights_free(vox_weights_t * w);

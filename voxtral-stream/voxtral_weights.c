@@ -37,15 +37,23 @@
 /* Upper bound on the number of tracked weight records (711 actual + slack). */
 #define WLOAD_MAX 800
 
+/* Copy mode for each weight record. */
+enum wload_mode {
+    WLOAD_BF16,     /* direct zero-copy from mmap */
+    WLOAD_F32,      /* BF16 -> F32 convert at copy */
+    WLOAD_QUANT,    /* BF16 -> F32 -> quantized type at copy */
+};
+
 typedef struct {
     const safetensor_t * src;
     struct ggml_tensor * dst;
-    int                  to_f32; /* 1 = convert BF16->F32 at copy, 0 = direct BF16 */
+    enum wload_mode      mode;
 } wload_record_t;
 
 typedef struct {
     safetensors_file_t * sf;
     struct ggml_context * ctx;
+    enum ggml_type        matmul_type;  /* desired type for matmul weights */
     wload_record_t records[WLOAD_MAX];
     int n;
     int err;
@@ -71,10 +79,8 @@ static const safetensor_t * wload_find(wload_state_t * s, const char * name) {
     return t;
 }
 
-/* Push a record into the state's record table. Caller has already created the
- * ggml tensor and verified the dtype/shape. */
 static void wload_push(wload_state_t * s, const safetensor_t * src,
-                       struct ggml_tensor * dst, int to_f32) {
+                       struct ggml_tensor * dst, enum wload_mode mode) {
     if (s->n >= WLOAD_MAX) {
         fprintf(stderr, "vox_weights: WLOAD_MAX exceeded (%d)\n", WLOAD_MAX);
         s->err = 1;
@@ -82,7 +88,7 @@ static void wload_push(wload_state_t * s, const safetensor_t * src,
     }
     s->records[s->n].src = src;
     s->records[s->n].dst = dst;
-    s->records[s->n].to_f32 = to_f32;
+    s->records[s->n].mode = mode;
     s->n++;
 }
 
@@ -114,7 +120,7 @@ static struct ggml_tensor * wload_f32_1d(wload_state_t * s, const char * name) {
     struct ggml_tensor * dst = ggml_new_tensor_1d(s->ctx, GGML_TYPE_F32, src->shape[0]);
     ggml_set_name(dst, name);
     if (wload_check_numel(s, name, dst, src) != 0) return NULL;
-    wload_push(s, src, dst, 1);
+    wload_push(s, src, dst, WLOAD_F32);
     return dst;
 }
 
@@ -132,7 +138,7 @@ static struct ggml_tensor * wload_f32_2d(wload_state_t * s, const char * name) {
                                                   src->shape[1], src->shape[0]);
     ggml_set_name(dst, name);
     if (wload_check_numel(s, name, dst, src) != 0) return NULL;
-    wload_push(s, src, dst, 1);
+    wload_push(s, src, dst, WLOAD_F32);
     return dst;
 }
 
@@ -151,11 +157,13 @@ static struct ggml_tensor * wload_f32_3d(wload_state_t * s, const char * name) {
                                                   src->shape[2], src->shape[1], src->shape[0]);
     ggml_set_name(dst, name);
     if (wload_check_numel(s, name, dst, src) != 0) return NULL;
-    wload_push(s, src, dst, 1);
+    wload_push(s, src, dst, WLOAD_F32);
     return dst;
 }
 
-/* Load a 2D BF16 matmul weight (zero-copy from mmap region). */
+/* Load a 2D matmul weight. When matmul_type == BF16, zero-copy from mmap.
+ * When matmul_type == Q8_0 (or other quantized), creates the tensor with
+ * the quantized type; the copy pass will convert BF16->F32->quant. */
 static struct ggml_tensor * wload_bf16_2d(wload_state_t * s, const char * name) {
     const safetensor_t * src = wload_find(s, name);
     if (!src) return NULL;
@@ -169,11 +177,13 @@ static struct ggml_tensor * wload_bf16_2d(wload_state_t * s, const char * name) 
         s->err = 1;
         return NULL;
     }
-    struct ggml_tensor * dst = ggml_new_tensor_2d(s->ctx, GGML_TYPE_BF16,
+    enum ggml_type dtype = s->matmul_type;
+    enum wload_mode mode = (dtype == GGML_TYPE_BF16) ? WLOAD_BF16 : WLOAD_QUANT;
+    struct ggml_tensor * dst = ggml_new_tensor_2d(s->ctx, dtype,
                                                   src->shape[1], src->shape[0]);
     ggml_set_name(dst, name);
     if (wload_check_numel(s, name, dst, src) != 0) return NULL;
-    wload_push(s, src, dst, 0);
+    wload_push(s, src, dst, mode);
     return dst;
 }
 
@@ -181,7 +191,8 @@ static struct ggml_tensor * wload_bf16_2d(wload_state_t * s, const char * name) 
 /* Public API                                                               */
 /* ------------------------------------------------------------------------ */
 
-vox_weights_t * vox_weights_load(const char * model_dir, ggml_backend_buffer_type_t buft) {
+vox_weights_t * vox_weights_load(const char * model_dir, ggml_backend_buffer_type_t buft,
+                                  enum ggml_type matmul_type) {
     /* ---- 1. Open safetensors file ---- */
     char path[1024];
     snprintf(path, sizeof(path), "%s/consolidated.safetensors", model_dir);
@@ -216,6 +227,7 @@ vox_weights_t * vox_weights_load(const char * model_dir, ggml_backend_buffer_typ
     wload_state_t s = {0};
     s.sf = sf;
     s.ctx = w->ctx;
+    s.matmul_type = matmul_type;
 
     char name[512];
 
@@ -353,27 +365,48 @@ vox_weights_t * vox_weights_load(const char * model_dir, ggml_backend_buffer_typ
         struct ggml_tensor * dst = s.records[i].dst;
         size_t nbytes = ggml_nbytes(dst);
 
-        if (s.records[i].to_f32) {
+        switch (s.records[i].mode) {
+        case WLOAD_F32: {
             /* BF16 -> F32 conversion (allocates a fresh float[]). */
             float * f32 = safetensors_get_f32(sf, src);
             if (!f32) {
                 fprintf(stderr, "vox_weights_load: safetensors_get_f32 failed for %s\n", src->name);
-                vox_weights_free(w);
-                safetensors_close(sf);
-                return NULL;
+                vox_weights_free(w); safetensors_close(sf); return NULL;
             }
             ggml_backend_tensor_set(dst, f32, 0, nbytes);
             free(f32);
-        } else {
+            break;
+        }
+        case WLOAD_BF16: {
             /* Direct BF16 zero-copy from mmap region. */
             const void * raw = safetensors_data(sf, src);
             if (!raw) {
                 fprintf(stderr, "vox_weights_load: safetensors_data failed for %s\n", src->name);
-                vox_weights_free(w);
-                safetensors_close(sf);
-                return NULL;
+                vox_weights_free(w); safetensors_close(sf); return NULL;
             }
             ggml_backend_tensor_set(dst, raw, 0, nbytes);
+            break;
+        }
+        case WLOAD_QUANT: {
+            /* BF16 -> F32 -> quantized type. */
+            int64_t nelem = ggml_nelements(dst);
+            float * f32 = safetensors_get_f32(sf, src);
+            if (!f32) {
+                fprintf(stderr, "vox_weights_load: safetensors_get_f32 failed for %s\n", src->name);
+                vox_weights_free(w); safetensors_close(sf); return NULL;
+            }
+            void * qbuf = malloc(nbytes);
+            if (!qbuf) {
+                fprintf(stderr, "vox_weights_load: quantize alloc failed for %s\n", src->name);
+                free(f32); vox_weights_free(w); safetensors_close(sf); return NULL;
+            }
+            const struct ggml_type_traits * tt = ggml_get_type_traits(dst->type);
+            tt->from_float_ref(f32, qbuf, nelem);
+            ggml_backend_tensor_set(dst, qbuf, 0, nbytes);
+            free(qbuf);
+            free(f32);
+            break;
+        }
         }
     }
 

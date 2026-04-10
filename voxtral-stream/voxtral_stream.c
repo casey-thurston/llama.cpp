@@ -203,20 +203,31 @@ static void read_f32_tensor(const struct ggml_tensor * t, float * dst) {
     ggml_backend_tensor_get(t, dst, 0, ggml_nbytes(t));
 }
 
-/* Read one BF16 row out of a 2D BF16 tensor and convert to F32. Used for
- * the tied tok_embeddings lookup in the decoder loop. */
-static void read_bf16_row_as_f32(const struct ggml_tensor * t, int row_idx, float * dst) {
+/* Read one row out of a 2D tensor (BF16 or quantized) and produce F32.
+ * Used for the tied tok_embeddings lookup in the decoder loop. */
+static void read_row_as_f32(const struct ggml_tensor * t, int row_idx, float * dst) {
     int64_t embed_dim = t->ne[0];
-    size_t row_bytes = (size_t) embed_dim * sizeof(uint16_t);
-    uint16_t * tmp = (uint16_t *) malloc(row_bytes);
-    ggml_backend_tensor_get(t, tmp, (size_t) row_idx * row_bytes, row_bytes);
-    for (int64_t i = 0; i < embed_dim; i++) {
-        uint32_t bits = ((uint32_t) tmp[i]) << 16;
-        float f;
-        memcpy(&f, &bits, sizeof(f));
-        dst[i] = f;
+    size_t row_bytes = t->nb[1];  /* stride between rows in bytes */
+
+    if (t->type == GGML_TYPE_BF16) {
+        size_t bf16_bytes = (size_t) embed_dim * sizeof(uint16_t);
+        uint16_t * tmp = (uint16_t *) malloc(bf16_bytes);
+        ggml_backend_tensor_get(t, tmp, (size_t) row_idx * row_bytes, bf16_bytes);
+        for (int64_t i = 0; i < embed_dim; i++) {
+            uint32_t bits = ((uint32_t) tmp[i]) << 16;
+            float f;
+            memcpy(&f, &bits, sizeof(f));
+            dst[i] = f;
+        }
+        free(tmp);
+    } else {
+        /* Quantized type: read raw row bytes, dequantize via type traits. */
+        void * tmp = malloc(row_bytes);
+        ggml_backend_tensor_get(t, tmp, (size_t) row_idx * row_bytes, row_bytes);
+        const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
+        tt->to_float(tmp, dst, embed_dim);
+        free(tmp);
     }
-    free(tmp);
 }
 
 /* Pad audio streaming-style: prepend N_LEFT_PAD_TOKENS*1280 zeros, append
@@ -816,7 +827,7 @@ static int run_decoder_step_streaming(vox_stream_t * s) {
 
     int text_token = (pos < prompt_len) ? prompt[pos] : s->prev_token;
 
-    read_bf16_row_as_f32(s->w->decoder.tok_embeddings, text_token, s->tok_embed_buf);
+    read_row_as_f32(s->w->decoder.tok_embeddings, text_token, s->tok_embed_buf);
     const float * audio = s->audio_embeds + (size_t) pos * VOX_DEC_DIM;
     for (int i = 0; i < VOX_DEC_DIM; i++)
         s->input_embed_buf[i] = audio[i] + s->tok_embed_buf[i];
@@ -892,7 +903,7 @@ static int run_decoder_prefill(vox_stream_t * s, int prompt_len) {
     for (int i = 1; i < prompt_len; i++) prompt[i] = TOKEN_STREAMING_PAD;
 
     for (int pos = 0; pos < prompt_len; pos++) {
-        read_bf16_row_as_f32(s->w->decoder.tok_embeddings, prompt[pos], s->tok_embed_buf);
+        read_row_as_f32(s->w->decoder.tok_embeddings, prompt[pos], s->tok_embed_buf);
         const float * audio = s->audio_embeds + (size_t) pos * VOX_DEC_DIM;
         float * dst = input_buf + (size_t) pos * VOX_DEC_DIM;
         for (int i = 0; i < VOX_DEC_DIM; i++)
@@ -1172,7 +1183,7 @@ static int run_offline_pipeline(vox_stream_t * s) {
     for (int pos = 0; pos < n_audio; pos++) {
         int text_token = (pos < prompt_len) ? prompt[pos] : prev_token;
 
-        read_bf16_row_as_f32(s->w->decoder.tok_embeddings, text_token, tok_embed_buf);
+        read_row_as_f32(s->w->decoder.tok_embeddings, text_token, tok_embed_buf);
         const float * audio = audio_embeds + (size_t) pos * VOX_DEC_DIM;
         for (int i = 0; i < VOX_DEC_DIM; i++) input_embed[i] = audio[i] + tok_embed_buf[i];
 
@@ -1244,6 +1255,7 @@ vox_stream_opts_t vox_stream_default_opts(void) {
     o.delay_tokens = 6;
     o.max_audio_seconds = 30;
     o.verbose = 0;
+    o.quant = 0;
     return o;
 }
 
@@ -1290,7 +1302,10 @@ vox_stream_t * vox_stream_init(const char * model_dir, const vox_stream_opts_t *
 
     /* Weights */
     if (s->opts.verbose) fprintf(stderr, "loading weights: %s\n", model_dir);
-    s->w = vox_weights_load(model_dir, s->buft);
+    enum ggml_type matmul_type = (s->opts.quant == 1) ? GGML_TYPE_Q8_0 : GGML_TYPE_BF16;
+    if (s->opts.verbose && matmul_type != GGML_TYPE_BF16)
+        fprintf(stderr, "weight quantization: %s\n", ggml_type_name(matmul_type));
+    s->w = vox_weights_load(model_dir, s->buft, matmul_type);
     if (!s->w) { fprintf(stderr, "vox_stream: vox_weights_load failed\n"); goto fail; }
     if (s->opts.verbose) {
         fprintf(stderr, "  %d tensors, %.2f GB\n",

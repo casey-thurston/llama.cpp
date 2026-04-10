@@ -167,6 +167,7 @@ int main(int argc, char ** argv) {
     int warmup = 0;
     const char * csv_path = NULL;
     int verbose = 0;
+    int quant = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -189,6 +190,11 @@ int main(int argc, char ** argv) {
             warmup = 1;
         } else if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
             csv_path = argv[++i];
+        } else if (strcmp(argv[i], "--quant") == 0 && i + 1 < argc) {
+            const char * q = argv[++i];
+            if (strcmp(q, "q8") == 0 || strcmp(q, "Q8_0") == 0) quant = 1;
+            else if (strcmp(q, "bf16") == 0 || strcmp(q, "none") == 0) quant = 0;
+            else { fprintf(stderr, "bad --quant value: %s (use q8 or bf16)\n", q); return 2; }
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = 1;
         } else { usage(argv[0]); return 2; }
@@ -199,6 +205,7 @@ int main(int argc, char ** argv) {
     vox_stream_opts_t opts = vox_stream_default_opts();
     opts.delay_tokens = delay_tokens;
     opts.verbose = verbose;
+    opts.quant = quant;
     vox_stream_t * s = vox_stream_init(model_dir, &opts);
     if (!s) return 1;
 

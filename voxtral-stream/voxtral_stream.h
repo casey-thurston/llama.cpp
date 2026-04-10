@@ -26,6 +26,7 @@ typedef struct {
     int delay_tokens;       /* sinusoidal time-embedding delay; voxtral default = 6 */
     int max_audio_seconds;  /* sizes per-clip sample buffer + decoder KV cache */
     int verbose;            /* 0 = quiet, 1 = log per-stage progress to stderr */
+    int quant;              /* 0 = BF16 (default), 1 = Q8_0 */
 } vox_stream_opts_t;
 
 /* Sensible defaults: backend=cuda, delay_tokens=6, max_audio_seconds=120, quiet. */
