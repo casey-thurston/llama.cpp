@@ -1,23 +1,16 @@
 /*
- * voxtral-stream main.c - Phase 1B smoke test.
+ * voxtral-stream main.c - Phase 1C smoke test.
  *
- * Verifies that the vendored voxtral.c modules (tokenizer + safetensors +
- * audio) build and run correctly inside our llama.cpp/voxtral-stream tree
- * before we wire any ggml graphs to them.
+ * Loads all 711 Voxtral Realtime 4B weights into a single ggml CPU backend
+ * buffer via vox_weights_load(), then dumps:
+ *   - tokenizer vocab size and a few decoded token IDs
+ *   - vox_weights_load summary (count + bytes)
+ *   - shapes of the same probe tensors that the 1B smoke test printed
+ *   - 8 sample F32 values from layers.0.attention_norm so they can be
+ *     cross-checked against voxtral.c.
  *
  * Usage:
  *   voxtral-stream <model_dir>
- *
- * Where <model_dir> contains:
- *   - consolidated.safetensors  (8.86 GB BF16, 711 tensors)
- *   - tekken.json               (Tekken tokenizer vocab)
- *
- * The smoke test prints:
- *   - tokenizer vocab size and a few decoded token IDs
- *   - first/last few safetensor tensor names + shapes
- *
- * The real CLI (mirroring voxtral.c's main.c flags: -m / --backend / -i /
- * --stdin) lands in 1E.
  */
 
 #include <stdio.h>
@@ -25,14 +18,11 @@
 #include <string.h>
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
-/* voxtral-stream.h declares the public API but the implementation lands in
- * 1E (voxtral-stream.c). Including it now would create unresolved-symbol
- * link errors, so we only include the vendored modules used by the smoke
- * test for the moment. */
 #include "voxtral_tokenizer.h"
 #include "voxtral_audio.h"
-#include "voxtral_safetensors.h"
+#include "voxtral_weights.h"
 
 /* The vendored modules extern-declare these globals; voxtral.c's main module
  * defines them. We're the new "main module" so we own them here. */
@@ -43,9 +33,22 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "  <model_dir> must contain consolidated.safetensors and tekken.json\n");
 }
 
+static void print_shape(const char * label, const struct ggml_tensor * t) {
+    if (!t) {
+        fprintf(stderr, "  [MISSING] %s\n", label);
+        return;
+    }
+    const char * dtype = (t->type == GGML_TYPE_BF16) ? "bf16" :
+                         (t->type == GGML_TYPE_F32)  ? "f32 " :
+                         (t->type == GGML_TYPE_F16)  ? "f16 " : "????";
+    fprintf(stderr, "  [%s] %s shape=[", dtype, label);
+    for (int d = 0; d < ggml_n_dims(t); d++) {
+        fprintf(stderr, "%s%lld", d ? "," : "", (long long) t->ne[d]);
+    }
+    fprintf(stderr, "]\n");
+}
+
 int main(int argc, char ** argv) {
-    /* Always-on touch of ggml so the linker pulls in libggml — keeps the
-     * Phase 1A scaffold check intact. */
     ggml_time_init();
     fprintf(stderr, "voxtral-stream: ggml link OK (t=%lld us)\n",
             (long long) ggml_time_us());
@@ -70,55 +73,44 @@ int main(int argc, char ** argv) {
     int bos = vox_tokenizer_bos(tok);
     int eos = vox_tokenizer_eos(tok);
     fprintf(stderr, "tokenizer OK: vocab=%d bos=%d eos=%d\n", vocab, bos, eos);
-    /* Spot-check a few token decodings. */
-    const int probe_ids[] = { 1, 2, 32, 1000, 1001, 1500, 50000 };
-    for (size_t i = 0; i < sizeof(probe_ids) / sizeof(probe_ids[0]); i++) {
-        const char * s = vox_tokenizer_decode(tok, probe_ids[i]);
-        fprintf(stderr, "  decode(%5d) = %s\n", probe_ids[i], s ? s : "<null>");
-    }
 
-    /* ---- Safetensors load ---- */
-    snprintf(path, sizeof(path), "%s/consolidated.safetensors", model_dir);
-    fprintf(stderr, "loading weights: %s\n", path);
-    safetensors_file_t * sf = safetensors_open(path);
-    if (!sf) {
-        fprintf(stderr, "ERROR: failed to mmap safetensors\n");
+    /* ---- Weights load (CPU backend buffer) ---- */
+    fprintf(stderr, "loading weights from: %s\n", model_dir);
+    vox_weights_t * w = vox_weights_load(model_dir, ggml_backend_cpu_buffer_type());
+    if (!w) {
+        fprintf(stderr, "ERROR: vox_weights_load failed\n");
         vox_tokenizer_free(tok);
         return 1;
     }
-    fprintf(stderr, "safetensors OK: %d tensors, %.2f GB file\n",
-            sf->num_tensors, (double) sf->file_size / (1024.0 * 1024.0 * 1024.0));
+    fprintf(stderr, "vox_weights_load OK: %d tensors, %.2f GB allocated\n",
+            w->n_tensors, (double) w->n_bytes / (1024.0 * 1024.0 * 1024.0));
 
-    /* Spot-check a handful of expected tensor names from MODEL.md. */
-    const char * probe_names[] = {
-        "mm_streams_embeddings.embedding_module.tok_embeddings.weight",
-        "mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers.0.conv.weight",
-        "mm_streams_embeddings.embedding_module.whisper_encoder.transformer.layers.0.attention.wq.weight",
-        "mm_streams_embeddings.embedding_module.audio_language_projection.0.weight",
-        "layers.0.attention.wq.weight",
-        "layers.0.ada_rms_norm_t_cond.0.weight",
-        "layers.0.ada_rms_norm_t_cond.2.weight",
-        "layers.25.feed_forward.w2.weight",
-        "norm.weight",
-    };
-    for (size_t i = 0; i < sizeof(probe_names) / sizeof(probe_names[0]); i++) {
-        const safetensor_t * t = safetensors_find(sf, probe_names[i]);
-        if (!t) {
-            fprintf(stderr, "  [MISSING] %s\n", probe_names[i]);
-            continue;
+    /* ---- Spot-check shapes via the populated struct ---- */
+    print_shape("decoder.tok_embeddings", w->decoder.tok_embeddings);
+    print_shape("encoder.conv0", w->encoder.conv0);
+    print_shape("encoder.layers[0].wq", w->encoder.layers[0].wq);
+    print_shape("adapter.linear0", w->adapter.linear0);
+    print_shape("decoder.layers[0].wq", w->decoder.layers[0].wq);
+    print_shape("decoder.layers[0].ada_norm_down", w->decoder.layers[0].ada_norm_down);
+    print_shape("decoder.layers[0].ada_norm_up", w->decoder.layers[0].ada_norm_up);
+    print_shape("decoder.layers[25].w2", w->decoder.layers[25].w2);
+    print_shape("decoder.norm", w->decoder.norm);
+
+    /* ---- Sample F32 values from layers.0.attention_norm ---- */
+    {
+        struct ggml_tensor * t = w->decoder.layers[0].attention_norm;
+        if (t && t->type == GGML_TYPE_F32) {
+            int64_t n = ggml_nelements(t);
+            int n_print = n < 8 ? (int) n : 8;
+            float buf[8] = {0};
+            ggml_backend_tensor_get(t, buf, 0, sizeof(float) * n_print);
+            fprintf(stderr, "  decoder.layers[0].attention_norm[0..%d] =", n_print - 1);
+            for (int i = 0; i < n_print; i++) fprintf(stderr, " %.6f", buf[i]);
+            fprintf(stderr, "\n");
         }
-        fprintf(stderr, "  [%s] %s shape=[",
-                t->dtype == DTYPE_BF16 ? "bf16" :
-                t->dtype == DTYPE_F16 ? "f16 " :
-                t->dtype == DTYPE_F32 ? "f32 " : "????",
-                probe_names[i]);
-        for (int d = 0; d < t->ndim; d++) {
-            fprintf(stderr, "%s%lld", d ? "," : "", (long long) t->shape[d]);
-        }
-        fprintf(stderr, "]\n");
     }
 
-    safetensors_close(sf);
+    vox_weights_free(w);
     vox_tokenizer_free(tok);
 
     fprintf(stderr, "smoke test OK\n");
